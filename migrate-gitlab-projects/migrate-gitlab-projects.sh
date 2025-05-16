@@ -7,15 +7,13 @@ SRC_GROUP_ID="your-source-group-id-or-path"
 SRC_ACCESS_TOKEN="${SRC_ACCESS_TOKEN:-your-source-access-token}"
 
 TARGET_GITLAB_URL="https://gitlab.example.com"
-TARGET_ROOT_NAMESPACE_PATH="your-target-group-path"  # e.g., mycompany/dev
+TARGET_ROOT_NAMESPACE_PATH="your-target-group-path"  # e.g. mycompany/dev
 TARGET_ACCESS_TOKEN="${TARGET_ACCESS_TOKEN:-your-target-access-token}"
 TARGET_PROXY="${TARGET_PROXY:-}"
 ALLOW_INSECURE_SSL="${ALLOW_INSECURE_SSL:-false}"
 
 OUTPUT_DIR="./gitlab_exports"
 LOG_FILE="gitlab_migration.log"
-
-# === INTERNAL SETUP ===
 
 mkdir -p "$OUTPUT_DIR"
 echo "=== GitLab Migration Started at $(date) ===" > "$LOG_FILE"
@@ -24,6 +22,7 @@ log() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
 }
 
+# CURL OPTIONS
 curl_args=()
 [ "$ALLOW_INSECURE_SSL" = true ] && curl_args+=(--insecure)
 
@@ -39,77 +38,62 @@ curl_target() {
     fi
 }
 
-# === FUNCTIONS ===
-
-get_all_projects_recursive() {
-    local GROUP_ID=$1
-    local RECURSIVE_PROJECTS=""
-
-    # Get immediate projects
-    local PROJECTS=$(curl_src "$SRC_GITLAB_URL/api/v4/groups/$GROUP_ID/projects?include_subgroups=true&per_page=100")
-    echo "$PROJECTS" | jq -c '.[]'  # Output each project JSON as one line
-
-    # Get subgroups
-    local SUBGROUPS=$(curl_src "$SRC_GITLAB_URL/api/v4/groups/$GROUP_ID/subgroups?per_page=100")
-    local SUBGROUP_IDS=$(echo "$SUBGROUPS" | jq -r '.[].id')
-
-    for SG_ID in $SUBGROUP_IDS; do
-        get_all_projects_recursive "$SG_ID"
-    done
-}
-
+# Get namespace ID from full path
 get_target_namespace_id() {
-    local REL_PATH="$1"
-    local FULL_PATH="$TARGET_ROOT_NAMESPACE_PATH/$REL_PATH"
-    local ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$FULL_PATH', safe=''))")
-
-    local NS_ID=$(curl_target "$TARGET_GITLAB_URL/api/v4/namespaces/$ENCODED_PATH" | jq -r '.id')
-    echo "$NS_ID"
+    local FULL_PATH="$1"
+    local NS=$(curl_target "$TARGET_GITLAB_URL/api/v4/namespaces?search=$(basename "$FULL_PATH")")
+    echo "$NS" | jq -r ".[] | select(.full_path==\"$FULL_PATH\") | .id"
 }
 
-# === MAIN ===
+# Recursively fetch all projects in a group
+get_all_projects() {
+    local GROUP_ID=$1
+    curl_src "$SRC_GITLAB_URL/api/v4/groups/$GROUP_ID/projects?include_subgroups=true&per_page=100"
+}
 
-log "Fetching all projects from source group and subgroups..."
-ALL_PROJECTS=$(get_all_projects_recursive "$SRC_GROUP_ID")
+# MAIN
+log "Fetching all projects from source group..."
+PROJECTS_JSON=$(get_all_projects "$SRC_GROUP_ID")
 
-echo "$ALL_PROJECTS" | while read -r PROJECT_JSON; do
-    PROJECT_ID=$(echo "$PROJECT_JSON" | jq -r '.id')
-    PROJECT_NAME=$(echo "$PROJECT_JSON" | jq -r '.path')
-    PATH_WITH_NAMESPACE=$(echo "$PROJECT_JSON" | jq -r '.path_with_namespace')
-    RELATIVE_GROUP_PATH=$(dirname "$PATH_WITH_NAMESPACE" | sed "s|^$(echo "$SRC_GROUP_ID" | sed 's/\//\\\//g')||" | sed 's|^/||')
+echo "$PROJECTS_JSON" | jq -c '.[]' | while read -r PROJECT; do
+    PROJECT_ID=$(echo "$PROJECT" | jq -r '.id')
+    PROJECT_NAME=$(echo "$PROJECT" | jq -r '.path')
+    PATH_WITH_NAMESPACE=$(echo "$PROJECT" | jq -r '.path_with_namespace')
+    
+    # Get group-relative path (excluding root group)
+    GROUP_PATH_ONLY=$(dirname "$PATH_WITH_NAMESPACE")
+    RELATIVE_GROUP_PATH=$(echo "$GROUP_PATH_ONLY" | sed "s|^$SRC_GROUP_ID||" | sed 's|^/||')
 
-    TARGET_NAMESPACE_ID=$(get_target_namespace_id "$RELATIVE_GROUP_PATH")
+    if [ -n "$RELATIVE_GROUP_PATH" ]; then
+        DEST_NAMESPACE_PATH="$TARGET_ROOT_NAMESPACE_PATH/$RELATIVE_GROUP_PATH"
+    else
+        DEST_NAMESPACE_PATH="$TARGET_ROOT_NAMESPACE_PATH"
+    fi
 
-    if [ "$TARGET_NAMESPACE_ID" == "null" ] || [ -z "$TARGET_NAMESPACE_ID" ]; then
-        log "❌ Could not find target namespace for: $RELATIVE_GROUP_PATH — skipping $PROJECT_NAME"
+    TARGET_NAMESPACE_ID=$(get_target_namespace_id "$DEST_NAMESPACE_PATH")
+
+    if [ -z "$TARGET_NAMESPACE_ID" ] || [ "$TARGET_NAMESPACE_ID" == "null" ]; then
+        log "Could not find target namespace for $DEST_NAMESPACE_PATH — skipping $PROJECT_NAME"
         continue
     fi
 
     EXPORT_FILE="$OUTPUT_DIR/$(echo "$PATH_WITH_NAMESPACE" | tr '/' '_').tar.gz"
-
-    log "Processing $PATH_WITH_NAMESPACE (ID: $PROJECT_ID) → target namespace ID: $TARGET_NAMESPACE_ID"
+    log "Processing $PATH_WITH_NAMESPACE → target ns: $DEST_NAMESPACE_PATH (ID: $TARGET_NAMESPACE_ID)"
 
     # Trigger export
     curl_src -X POST "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export" > /dev/null
     log "Triggered export for $PROJECT_NAME"
 
-    # Wait for export to finish
+    # Wait for export to complete
     while true; do
         STATUS=$(curl_src "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export" | jq -r '.export_status')
-        if [ "$STATUS" == "finished" ]; then
-            log "Export ready for $PROJECT_NAME"
-            break
-        elif [ "$STATUS" == "none" ]; then
-            log "❌ Failed to export $PROJECT_NAME — skipping"
-            continue 2
-        else
-            sleep 5
-        fi
+        [ "$STATUS" == "finished" ] && break
+        [ "$STATUS" == "none" ] && log "Failed to export $PROJECT_NAME — skipping" && continue 2
+        sleep 5
     done
 
-    # Download export
-    curl_src "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export/download" \
-        --output "$EXPORT_FILE"
+    # Download archive
+    curl_src "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export/download" --output "$EXPORT_FILE"
     log "Downloaded export to $EXPORT_FILE"
 
     # Create project on target
@@ -119,17 +103,13 @@ echo "$ALL_PROJECTS" | while read -r PROJECT_JSON; do
         "$TARGET_GITLAB_URL/api/v4/projects")
 
     NEW_PROJECT_ID=$(echo "$NEW_PROJECT" | jq -r '.id')
-    if [ "$NEW_PROJECT_ID" == "null" ]; then
-        ERR=$(echo "$NEW_PROJECT" | jq -r '.message')
-        log "❌ Failed to create $PROJECT_NAME on target GitLab: $ERR"
-        continue
-    fi
+    [ "$NEW_PROJECT_ID" == "null" ] && log "Failed to create project $PROJECT_NAME" && continue
 
-    # Upload export archive
+    # Upload export
     curl_target -X POST \
         -F "file=@$EXPORT_FILE" \
         "$TARGET_GITLAB_URL/api/v4/projects/$NEW_PROJECT_ID/import" > /dev/null
-    log "✅ Imported $PROJECT_NAME to target namespace $RELATIVE_GROUP_PATH"
+    log "Imported $PROJECT_NAME"
 done
 
-log "✅ All projects processed."
+log "All projects processed."
