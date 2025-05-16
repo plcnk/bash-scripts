@@ -1,58 +1,65 @@
 #!/bin/bash
 
-# ====== Configuration ======
+# === Configuration ===
 SRC_GITLAB_URL="https://source.gitlab.com"
-SRC_TOKEN="your_source_token"
-SRC_GROUP_ID="1234"  # Use numeric group ID
+DST_GITLAB_URL="https://destination.gitlab.com"
+SRC_GROUP_ID="12345"  # Numeric group ID, not path
+SRC_TOKEN="your_source_gitlab_token"
+DST_TOKEN="your_destination_gitlab_token"
+PROXY="http://your.proxy.server:port"
 
-DEST_GITLAB_URL="https://destination.gitlab.com"
-DEST_TOKEN="your_destination_token"
-DEST_GROUP_ID="5678"  # Use numeric group ID
-
-# Proxy for destination GitLab
-export https_proxy="http://your.proxy:port"
-
+# Temporary storage
 EXPORT_DIR="./exports"
 mkdir -p "$EXPORT_DIR"
 
-# ====== Export projects from source GitLab ======
-echo "Fetching projects from source group $SRC_GROUP_ID..."
+# === Step 1: Get all projects in the group (not including subgroups) ===
+echo "[*] Fetching project list from source group..."
 
 projects=$(curl -s -k --header "PRIVATE-TOKEN: $SRC_TOKEN" \
-  "$SRC_GITLAB_URL/api/v4/groups/$SRC_GROUP_ID/projects?per_page=100" | jq -r '.[].id')
+  "$SRC_GITLAB_URL/api/v4/groups/$SRC_GROUP_ID/projects?include_subgroups=false&per_page=100" | jq -c '.[]')
 
-for project_id in $projects; do
-  echo "Requesting export for project ID: $project_id"
-  
-  curl -s -k --request POST --header "PRIVATE-TOKEN: $SRC_TOKEN" \
-    "$SRC_GITLAB_URL/api/v4/projects/$project_id/export" > /dev/null
+# === Step 2: Export and download each project ===
+for project in $projects; do
+  project_id=$(echo "$project" | jq '.id')
+  project_name=$(echo "$project" | jq -r '.name')
+  project_path=$(echo "$project" | jq -r '.path')
 
-  echo "Waiting for export to finish..."
+  echo "[*] Exporting project: $project_name"
+
+  # Start export
+  curl -s -k --request POST \
+    --header "PRIVATE-TOKEN: $SRC_TOKEN" \
+    "$SRC_GITLAB_URL/api/v4/projects/$project_id/export" >/dev/null
+
+  # Wait for export to complete
+  echo "    Waiting for export to finish..."
   while true; do
-    status=$(curl -s -k --header "PRIVATE-TOKEN: $SRC_TOKEN" \
+    export_status=$(curl -s -k --header "PRIVATE-TOKEN: $SRC_TOKEN" \
       "$SRC_GITLAB_URL/api/v4/projects/$project_id/export" | jq -r '.export_status')
-
-    if [[ "$status" == "finished" ]]; then
+    if [[ "$export_status" == "finished" ]]; then
       break
     fi
-    sleep 3
+    sleep 2
   done
 
-  echo "Downloading export file..."
+  # Download the export file
+  echo "    Downloading export for $project_name..."
   curl -s -k --header "PRIVATE-TOKEN: $SRC_TOKEN" \
     "$SRC_GITLAB_URL/api/v4/projects/$project_id/export/download" \
-    -o "$EXPORT_DIR/project_$project_id.tar.gz"
+    -o "$EXPORT_DIR/${project_path}.tar.gz"
 done
 
-# ====== Import to destination GitLab ======
+# === Step 3: Import projects to destination GitLab ===
 for file in "$EXPORT_DIR"/*.tar.gz; do
-  echo "Importing $file to destination GitLab..."
+  slug=$(basename "$file" .tar.gz)
 
-  curl -s -k --header "PRIVATE-TOKEN: $DEST_TOKEN" \
-    -F "path=$(basename "$file" .tar.gz)" \
-    -F "namespace_id=$DEST_GROUP_ID" \
+  echo "[*] Importing project: $slug"
+
+  curl -s -k --proxy "$PROXY" --request POST \
+    --header "PRIVATE-TOKEN: $DST_TOKEN" \
+    -F "path=$slug" \
     -F "file=@$file" \
-    "$DEST_GITLAB_URL/api/v4/projects/import"
+    "$DST_GITLAB_URL/api/v4/projects/import" | jq
 done
 
-echo "Migration complete."
+echo "[*] Migration complete!"
