@@ -15,10 +15,6 @@ ALLOW_INSECURE_SSL="${ALLOW_INSECURE_SSL:-false}"
 OUTPUT_DIR="./gitlab_exports"
 LOG_FILE="gitlab_migration.log"
 
-# Dry run mode
-DRY_RUN=false
-[ "$1" == "--dry-run" ] && DRY_RUN=true && echo "[INFO] Dry-run mode enabled."
-
 # === INTERNAL SETUP ===
 
 mkdir -p "$OUTPUT_DIR"
@@ -92,11 +88,6 @@ echo "$ALL_PROJECTS" | while read -r PROJECT_JSON; do
     EXPORT_FILE="$OUTPUT_DIR/$(echo "$PATH_WITH_NAMESPACE" | tr '/' '_').tar.gz"
 
     log "Processing $PATH_WITH_NAMESPACE (ID: $PROJECT_ID) → target namespace ID: $TARGET_NAMESPACE_ID"
-
-    if [ "$DRY_RUN" = true ]; then
-        log "[Dry-Run] Would export and import $PROJECT_NAME to $RELATIVE_GROUP_PATH"
-        continue
-    fi
 
     # Trigger export
     curl_src -X POST "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export" > /dev/null
