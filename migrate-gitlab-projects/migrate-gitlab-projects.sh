@@ -1,115 +1,102 @@
 #!/bin/bash
 
-# === CONFIGURATION ===
+set -euo pipefail
 
-SRC_GITLAB_URL="https://gitlab.com"
-SRC_GROUP_ID="your-source-group-id-or-path"
-SRC_ACCESS_TOKEN="${SRC_ACCESS_TOKEN:-your-source-access-token}"
-
-TARGET_GITLAB_URL="https://gitlab.example.com"
-TARGET_ROOT_NAMESPACE_PATH="your-target-group-path"  # e.g. mycompany/dev
-TARGET_ACCESS_TOKEN="${TARGET_ACCESS_TOKEN:-your-target-access-token}"
-TARGET_PROXY="${TARGET_PROXY:-}"
-ALLOW_INSECURE_SSL="${ALLOW_INSECURE_SSL:-false}"
-
-OUTPUT_DIR="./gitlab_exports"
-LOG_FILE="gitlab_migration.log"
-
-mkdir -p "$OUTPUT_DIR"
-echo "=== GitLab Migration Started at $(date) ===" > "$LOG_FILE"
+LOG_FILE="migration_$(date +%Y%m%d_%H%M%S).log"
+TEMP_DIR="./gitlab_migration"
+mkdir -p "$TEMP_DIR"
 
 log() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-# CURL OPTIONS
-curl_args=()
-[ "$ALLOW_INSECURE_SSL" = true ] && curl_args+=(--insecure)
-
-curl_src() {
-    curl "${curl_args[@]}" -s --header "PRIVATE-TOKEN: $SRC_ACCESS_TOKEN" "$@"
+require_env() {
+    for var in "$@"; do
+        if [[ -z "${!var:-}" ]]; then
+            log "Error: Environment variable $var is not set."
+            exit 1
+        fi
+    done
 }
 
-curl_target() {
-    if [ -n "$TARGET_PROXY" ]; then
-        curl "${curl_args[@]}" --proxy "$TARGET_PROXY" -s --header "PRIVATE-TOKEN: $TARGET_ACCESS_TOKEN" "$@"
-    else
-        curl "${curl_args[@]}" -s --header "PRIVATE-TOKEN: $TARGET_ACCESS_TOKEN" "$@"
-    fi
-}
+require_env SOURCE_GITLAB SOURCE_TOKEN SOURCE_GROUP_ID DEST_GITLAB DEST_TOKEN DEST_GROUP_ID DEST_PROXY
 
-# Get namespace ID from full path
-get_target_namespace_id() {
-    local FULL_PATH="$1"
-    local NS=$(curl_target "$TARGET_GITLAB_URL/api/v4/namespaces?search=$(basename "$FULL_PATH")")
-    echo "$NS" | jq -r ".[] | select(.full_path==\"$FULL_PATH\") | .id"
-}
-
-# Recursively fetch all projects in a group
 get_all_projects() {
-    local GROUP_ID=$1
-    curl_src "$SRC_GITLAB_URL/api/v4/groups/$GROUP_ID/projects?include_subgroups=true&per_page=100"
+    local group_id="$1"
+    local page=1
+    local per_page=100
+    local all_projects=()
+
+    while :; do
+        resp=$(curl -sk --header "PRIVATE-TOKEN: $SOURCE_TOKEN" \
+            "$SOURCE_GITLAB/api/v4/groups/$group_id/projects?include_subgroups=true&per_page=$per_page&page=$page")
+
+        mapfile -t projects < <(echo "$resp" | grep -o '"id":[0-9]*' | cut -d ':' -f2)
+
+        [[ "${#projects[@]}" -eq 0 ]] && break
+
+        all_projects+=("${projects[@]}")
+        ((page++))
+    done
+
+    echo "${all_projects[@]}"
 }
 
-# MAIN
-log "Fetching all projects from source group..."
-PROJECTS_JSON=$(get_all_projects "$SRC_GROUP_ID")
+export_project() {
+    local project_id="$1"
 
-echo "$PROJECTS_JSON" | jq -c '.[]' | while read -r PROJECT; do
-    PROJECT_ID=$(echo "$PROJECT" | jq -r '.id')
-    PROJECT_NAME=$(echo "$PROJECT" | jq -r '.path')
-    PATH_WITH_NAMESPACE=$(echo "$PROJECT" | jq -r '.path_with_namespace')
-    
-    # Get group-relative path (excluding root group)
-    GROUP_PATH_ONLY=$(dirname "$PATH_WITH_NAMESPACE")
-    RELATIVE_GROUP_PATH=$(echo "$GROUP_PATH_ONLY" | sed "s|^$SRC_GROUP_ID||" | sed 's|^/||')
+    log "Requesting export for project $project_id"
+    curl -sk -X POST --header "PRIVATE-TOKEN: $SOURCE_TOKEN" \
+        "$SOURCE_GITLAB/api/v4/projects/$project_id/export" > /dev/null
 
-    if [ -n "$RELATIVE_GROUP_PATH" ]; then
-        DEST_NAMESPACE_PATH="$TARGET_ROOT_NAMESPACE_PATH/$RELATIVE_GROUP_PATH"
-    else
-        DEST_NAMESPACE_PATH="$TARGET_ROOT_NAMESPACE_PATH"
-    fi
-
-    TARGET_NAMESPACE_ID=$(get_target_namespace_id "$DEST_NAMESPACE_PATH")
-
-    if [ -z "$TARGET_NAMESPACE_ID" ] || [ "$TARGET_NAMESPACE_ID" == "null" ]; then
-        log "Could not find target namespace for $DEST_NAMESPACE_PATH — skipping $PROJECT_NAME"
-        continue
-    fi
-
-    EXPORT_FILE="$OUTPUT_DIR/$(echo "$PATH_WITH_NAMESPACE" | tr '/' '_').tar.gz"
-    log "Processing $PATH_WITH_NAMESPACE → target ns: $DEST_NAMESPACE_PATH (ID: $TARGET_NAMESPACE_ID)"
-
-    # Trigger export
-    curl_src -X POST "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export" > /dev/null
-    log "Triggered export for $PROJECT_NAME"
-
-    # Wait for export to complete
     while true; do
-        STATUS=$(curl_src "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export" | jq -r '.export_status')
-        [ "$STATUS" == "finished" ] && break
-        [ "$STATUS" == "none" ] && log "Failed to export $PROJECT_NAME — skipping" && continue 2
+        status=$(curl -sk --header "PRIVATE-TOKEN: $SOURCE_TOKEN" \
+            "$SOURCE_GITLAB/api/v4/projects/$project_id/export" | grep -o '"export_status":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+
+        [[ "$status" == "finished" ]] && break
+        log "Waiting for export to finish for project $project_id (status: $status)"
         sleep 5
     done
 
-    # Download archive
-    curl_src "$SRC_GITLAB_URL/api/v4/projects/$PROJECT_ID/export/download" --output "$EXPORT_FILE"
-    log "Downloaded export to $EXPORT_FILE"
+    log "Downloading export for project $project_id"
+    curl -sk --header "PRIVATE-TOKEN: $SOURCE_TOKEN" \
+        "$SOURCE_GITLAB/api/v4/projects/$project_id/export/download" \
+        -o "$TEMP_DIR/project_${project_id}.tar.gz"
+}
 
-    # Create project on target
-    NEW_PROJECT=$(curl_target -X POST \
-        -H "Content-Type: application/json" \
-        -d "{\"name\": \"$PROJECT_NAME\", \"namespace_id\": \"$TARGET_NAMESPACE_ID\"}" \
-        "$TARGET_GITLAB_URL/api/v4/projects")
+import_project() {
+    local file="$1"
+    local name="$2"
+    local path="$3"
 
-    NEW_PROJECT_ID=$(echo "$NEW_PROJECT" | jq -r '.id')
-    [ "$NEW_PROJECT_ID" == "null" ] && log "Failed to create project $PROJECT_NAME" && continue
+    log "Importing project: $name ($path) to destination group $DEST_GROUP_ID"
 
-    # Upload export
-    curl_target -X POST \
-        -F "file=@$EXPORT_FILE" \
-        "$TARGET_GITLAB_URL/api/v4/projects/$NEW_PROJECT_ID/import" > /dev/null
-    log "Imported $PROJECT_NAME"
-done
+    curl -sk --proxy "$DEST_PROXY" \
+        --header "PRIVATE-TOKEN: $DEST_TOKEN" \
+        -F "path=$path" \
+        -F "name=$name" \
+        -F "namespace_id=$DEST_GROUP_ID" \
+        -F "file=@$file" \
+        "$DEST_GITLAB/api/v4/projects/import"
+}
 
-log "All projects processed."
+main() {
+    project_ids=$(get_all_projects "$SOURCE_GROUP_ID")
+
+    for pid in $project_ids; do
+        meta=$(curl -sk --header "PRIVATE-TOKEN: $SOURCE_TOKEN" \
+            "$SOURCE_GITLAB/api/v4/projects/$pid")
+
+        name=$(echo "$meta" | grep -o '"name":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+        path=$(echo "$meta" | grep -o '"path":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+
+        log "Processing project $pid: $name"
+        export_project "$pid"
+        import_project "$TEMP_DIR/project_${pid}.tar.gz" "$name" "$path"
+        log "Finished importing $name"
+    done
+
+    log "All projects migrated."
+}
+
+main
